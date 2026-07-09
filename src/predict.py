@@ -88,8 +88,8 @@ def build_match_features(home: str, away: str) -> pd.DataFrame:
     )
 
 
-def predict_match(home: str, away: str) -> dict:
-    """Return outcome probabilities and expected goals for home vs away."""
+def predict_match(home: str, away: str, neutral: bool = False) -> dict:
+    """Return outcome probabilities and expected goals for a matchup."""
     if not OUTCOME_MODEL_PATH.exists() or not GOALS_MODEL_PATH.exists():
         raise FileNotFoundError(
             "Trained models not found. Run: python src/train_model.py"
@@ -98,33 +98,96 @@ def predict_match(home: str, away: str) -> dict:
     outcome_model = joblib.load(OUTCOME_MODEL_PATH)
     goals_model = joblib.load(GOALS_MODEL_PATH)
 
-    home = normalize_team(home)
-    away = normalize_team(away)
-    features = build_match_features(home, away)
+    team_a = normalize_team(home)
+    team_b = normalize_team(away)
 
+    if neutral:
+        # Neutral venue: no home advantage in goals model. Average both team
+        # orderings so the first CLI argument does not get an implicit edge.
+        result_ab = _predict_single_order(outcome_model, goals_model, team_a, team_b, neutral=True)
+        result_ba = _predict_single_order(outcome_model, goals_model, team_b, team_a, neutral=True)
+
+        team_a_win = (result_ab["team_a_win_prob"] + result_ba["team_b_win_prob"]) / 2
+        team_b_win = (result_ab["team_b_win_prob"] + result_ba["team_a_win_prob"]) / 2
+        draw = (result_ab["draw_prob"] + result_ba["draw_prob"]) / 2
+        pred_a_goals = (result_ab["team_a_goals"] + result_ba["team_b_goals"]) / 2
+        pred_b_goals = (result_ab["team_b_goals"] + result_ba["team_a_goals"]) / 2
+
+        probs = [team_a_win, draw, team_b_win]
+        pred_class = int(np.argmax(probs))
+        outcome_labels = {0: f"{team_a} win", 1: "Draw", 2: f"{team_b} win"}
+
+        return {
+            "team_a": team_a,
+            "team_b": team_b,
+            "neutral": True,
+            "team_a_win_prob": float(team_a_win),
+            "draw_prob": float(draw),
+            "team_b_win_prob": float(team_b_win),
+            "predicted_outcome": outcome_labels[pred_class],
+            "predicted_team_a_goals": float(pred_a_goals),
+            "predicted_team_b_goals": float(pred_b_goals),
+        }
+
+    return _predict_single_order(outcome_model, goals_model, team_a, team_b, neutral=False)
+
+
+def _predict_single_order(
+    outcome_model,
+    goals_model,
+    team_a: str,
+    team_b: str,
+    neutral: bool,
+) -> dict:
+    """Predict with team_a in the home slot and team_b in the away slot."""
+    features = build_match_features(team_a, team_b)
     probs = outcome_model.predict_proba(features[OUTCOME_FEATURES])[0]
-    pred_class = int(np.argmax(probs))
 
-    home_row = pd.DataFrame([{"team": home, "opponent": away, "is_home": 1}])
-    away_row = pd.DataFrame([{"team": away, "opponent": home, "is_home": 0}])
-    pred_home = float(goals_model.predict(home_row)[0])
-    pred_away = float(goals_model.predict(away_row)[0])
+    # On neutral ground both teams get is_home=0 (no home-advantage boost).
+    home_flag = 0 if neutral else 1
+    team_a_row = pd.DataFrame([{"team": team_a, "opponent": team_b, "is_home": home_flag}])
+    team_b_row = pd.DataFrame([{"team": team_b, "opponent": team_a, "is_home": 0}])
+    pred_a_goals = float(goals_model.predict(team_a_row)[0])
+    pred_b_goals = float(goals_model.predict(team_b_row)[0])
 
     return {
-        "home_team": home,
-        "away_team": away,
-        "home_win_prob": float(probs[0]),
+        "team_a": team_a,
+        "team_b": team_b,
+        "neutral": neutral,
+        "team_a_win_prob": float(probs[0]),
         "draw_prob": float(probs[1]),
+        "team_b_win_prob": float(probs[2]),
+        "predicted_outcome": OUTCOME_LABELS[int(np.argmax(probs))],
+        "team_a_goals": pred_a_goals,
+        "team_b_goals": pred_b_goals,
+        # Legacy keys for non-neutral display
+        "home_team": team_a,
+        "away_team": team_b,
+        "home_win_prob": float(probs[0]),
         "away_win_prob": float(probs[2]),
-        "predicted_outcome": OUTCOME_LABELS[pred_class],
-        "predicted_home_goals": pred_home,
-        "predicted_away_goals": pred_away,
+        "predicted_home_goals": pred_a_goals,
+        "predicted_away_goals": pred_b_goals,
     }
 
 
 def print_prediction(result: dict) -> None:
     """Pretty-print prediction output."""
-    print(f"\n{result['home_team']} vs {result['away_team']}")
+    if result.get("neutral"):
+        print(f"\n{result['team_a']} vs {result['team_b']}  (neutral venue)")
+        print("-" * 40)
+        print(
+            f"{result['team_a']} win: {result['team_a_win_prob']:.1%} | "
+            f"Draw: {result['draw_prob']:.1%} | "
+            f"{result['team_b']} win: {result['team_b_win_prob']:.1%}"
+        )
+        print(f"Most likely outcome: {result['predicted_outcome']}")
+        print(
+            f"Predicted score: {result['predicted_team_a_goals']:.2f} - "
+            f"{result['predicted_team_b_goals']:.2f}"
+        )
+        return
+
+    print(f"\n{result['home_team']} vs {result['away_team']}  (home vs away)")
     print("-" * 40)
     print(
         f"Home win: {result['home_win_prob']:.1%} | "
@@ -142,11 +205,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Predict match outcome and goals for two national teams"
     )
-    parser.add_argument("home_team", help="Home team name (e.g. Spain)")
-    parser.add_argument("away_team", help="Away team name (e.g. Belgium)")
+    parser.add_argument("home_team", help="First team (e.g. Spain)")
+    parser.add_argument("away_team", help="Second team (e.g. Belgium)")
+    parser.add_argument(
+        "--neutral",
+        action="store_true",
+        help="Neutral venue (e.g. both teams playing in USA) — no home advantage",
+    )
     args = parser.parse_args()
 
-    result = predict_match(args.home_team, args.away_team)
+    result = predict_match(args.home_team, args.away_team, neutral=args.neutral)
     print_prediction(result)
 
 
