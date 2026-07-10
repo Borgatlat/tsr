@@ -3,6 +3,7 @@ Predict win/draw/loss probabilities and expected goals for a matchup.
 
 Run from project root:
     python predict.py Spain Belgium
+    python predict.py Spain France --neutral
 
 Or:
     python src/predict.py Spain Belgium
@@ -25,10 +26,17 @@ from config import (
     FIFA_RAW,
     GOALS_MODEL_PATH,
     MATCHES_FILTERED,
+    NEUTRAL_OUTCOME_MODEL_PATH,
     OUTCOME_MODEL_PATH,
     normalize_team,
 )
-from features import _h2h_home_rate, _lookup_fifa_gap, _team_form
+from features import (
+    NEUTRAL_OUTCOME_FEATURES,
+    _h2h_home_rate,
+    _lookup_fifa_gap,
+    _team_form,
+    build_neutral_features,
+)
 from train_model import OUTCOME_FEATURES, OUTCOME_LABELS
 
 
@@ -59,7 +67,7 @@ def _load_histories() -> tuple[dict, dict]:
 
 
 def build_match_features(home: str, away: str) -> pd.DataFrame:
-    """Assemble feature vector for a hypothetical home-vs-away fixture today."""
+    """Assemble feature vector for a home-vs-away fixture."""
     home = normalize_team(home)
     away = normalize_team(away)
 
@@ -88,6 +96,37 @@ def build_match_features(home: str, away: str) -> pd.DataFrame:
     )
 
 
+def _neutral_prediction(
+    outcome_model,
+    goals_model,
+    team_a: str,
+    team_b: str,
+) -> dict:
+    """Single-pass neutral prediction for team_a vs team_b."""
+    team_history, h2h_history = _load_histories()
+    features = build_neutral_features(team_a, team_b, team_history, h2h_history)
+    probs = outcome_model.predict_proba(features[NEUTRAL_OUTCOME_FEATURES])[0]
+    pred_class = int(np.argmax(probs))
+    outcome_labels = {0: f"{team_a} win", 1: "Draw", 2: f"{team_b} win"}
+
+    team_a_row = pd.DataFrame([{"team": team_a, "opponent": team_b, "is_home": 0}])
+    team_b_row = pd.DataFrame([{"team": team_b, "opponent": team_a, "is_home": 0}])
+    pred_a_goals = float(goals_model.predict(team_a_row)[0])
+    pred_b_goals = float(goals_model.predict(team_b_row)[0])
+
+    return {
+        "team_a": team_a,
+        "team_b": team_b,
+        "neutral": True,
+        "team_a_win_prob": float(probs[0]),
+        "draw_prob": float(probs[1]),
+        "team_b_win_prob": float(probs[2]),
+        "predicted_outcome": outcome_labels[pred_class],
+        "predicted_team_a_goals": pred_a_goals,
+        "predicted_team_b_goals": pred_b_goals,
+    }
+
+
 def predict_match(home: str, away: str, neutral: bool = False) -> dict:
     """Return outcome probabilities and expected goals for a matchup."""
     if not OUTCOME_MODEL_PATH.exists() or not GOALS_MODEL_PATH.exists():
@@ -95,23 +134,26 @@ def predict_match(home: str, away: str, neutral: bool = False) -> dict:
             "Trained models not found. Run: python src/train_model.py"
         )
 
-    outcome_model = joblib.load(OUTCOME_MODEL_PATH)
     goals_model = joblib.load(GOALS_MODEL_PATH)
-
     team_a = normalize_team(home)
     team_b = normalize_team(away)
 
     if neutral:
-        # Neutral venue: no home advantage in goals model. Average both team
-        # orderings so the first CLI argument does not get an implicit edge.
-        result_ab = _predict_single_order(outcome_model, goals_model, team_a, team_b, neutral=True)
-        result_ba = _predict_single_order(outcome_model, goals_model, team_b, team_a, neutral=True)
+        if not NEUTRAL_OUTCOME_MODEL_PATH.exists():
+            raise FileNotFoundError(
+                "Neutral model not found. Run: python src/train_model.py"
+            )
+        outcome_model = joblib.load(NEUTRAL_OUTCOME_MODEL_PATH)
 
-        team_a_win = (result_ab["team_a_win_prob"] + result_ba["team_b_win_prob"]) / 2
-        team_b_win = (result_ab["team_b_win_prob"] + result_ba["team_a_win_prob"]) / 2
-        draw = (result_ab["draw_prob"] + result_ba["draw_prob"]) / 2
-        pred_a_goals = (result_ab["team_a_goals"] + result_ba["team_b_goals"]) / 2
-        pred_b_goals = (result_ab["team_b_goals"] + result_ba["team_a_goals"]) / 2
+        # Average both orderings so argument order never affects the result.
+        ab = _neutral_prediction(outcome_model, goals_model, team_a, team_b)
+        ba = _neutral_prediction(outcome_model, goals_model, team_b, team_a)
+
+        team_a_win = (ab["team_a_win_prob"] + ba["team_b_win_prob"]) / 2
+        team_b_win = (ab["team_b_win_prob"] + ba["team_a_win_prob"]) / 2
+        draw = (ab["draw_prob"] + ba["draw_prob"]) / 2
+        pred_a_goals = (ab["predicted_team_a_goals"] + ba["predicted_team_b_goals"]) / 2
+        pred_b_goals = (ab["predicted_team_b_goals"] + ba["predicted_team_a_goals"]) / 2
 
         probs = [team_a_win, draw, team_b_win]
         pred_class = int(np.argmax(probs))
@@ -129,23 +171,17 @@ def predict_match(home: str, away: str, neutral: bool = False) -> dict:
             "predicted_team_b_goals": float(pred_b_goals),
         }
 
-    return _predict_single_order(outcome_model, goals_model, team_a, team_b, neutral=False)
+    return _predict_home_away(team_a, team_b, goals_model)
 
 
-def _predict_single_order(
-    outcome_model,
-    goals_model,
-    team_a: str,
-    team_b: str,
-    neutral: bool,
-) -> dict:
-    """Predict with team_a in the home slot and team_b in the away slot."""
+def _predict_home_away(team_a: str, team_b: str, goals_model) -> dict:
+    """Predict a true home-vs-away fixture (team_a at home)."""
+    outcome_model = joblib.load(OUTCOME_MODEL_PATH)
     features = build_match_features(team_a, team_b)
     probs = outcome_model.predict_proba(features[OUTCOME_FEATURES])[0]
+    pred_class = int(np.argmax(probs))
 
-    # On neutral ground both teams get is_home=0 (no home-advantage boost).
-    home_flag = 0 if neutral else 1
-    team_a_row = pd.DataFrame([{"team": team_a, "opponent": team_b, "is_home": home_flag}])
+    team_a_row = pd.DataFrame([{"team": team_a, "opponent": team_b, "is_home": 1}])
     team_b_row = pd.DataFrame([{"team": team_b, "opponent": team_a, "is_home": 0}])
     pred_a_goals = float(goals_model.predict(team_a_row)[0])
     pred_b_goals = float(goals_model.predict(team_b_row)[0])
@@ -153,18 +189,13 @@ def _predict_single_order(
     return {
         "team_a": team_a,
         "team_b": team_b,
-        "neutral": neutral,
-        "team_a_win_prob": float(probs[0]),
-        "draw_prob": float(probs[1]),
-        "team_b_win_prob": float(probs[2]),
-        "predicted_outcome": OUTCOME_LABELS[int(np.argmax(probs))],
-        "team_a_goals": pred_a_goals,
-        "team_b_goals": pred_b_goals,
-        # Legacy keys for non-neutral display
+        "neutral": False,
         "home_team": team_a,
         "away_team": team_b,
         "home_win_prob": float(probs[0]),
+        "draw_prob": float(probs[1]),
         "away_win_prob": float(probs[2]),
+        "predicted_outcome": OUTCOME_LABELS[pred_class],
         "predicted_home_goals": pred_a_goals,
         "predicted_away_goals": pred_b_goals,
     }
@@ -210,7 +241,7 @@ def main() -> None:
     parser.add_argument(
         "--neutral",
         action="store_true",
-        help="Neutral venue (e.g. both teams playing in USA) — no home advantage",
+        help="Neutral venue — uses dedicated neutral outcome model",
     )
     args = parser.parse_args()
 

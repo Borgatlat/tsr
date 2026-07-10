@@ -75,3 +75,11 @@ python predict.py Spain Belgium
 2. **Goals regressor** — `PoissonRegressor` on team-level rows (home and away as separate observations) with one-hot team and opponent encodings
 
 Both models use `sample_weight` from the recency column.
+
+For **neutral venues** (World Cup, USA friendlies, etc.), a separate `neutral_outcome_classifier` is trained on matches where `neutral=True`, using symmetric features (`win_rate_diff`, `h2h_team_a_win_rate`, etc.) with mirrored training rows. Use:
+
+```bash
+python predict.py Spain France --neutral
+```
+
+The goals model sets `is_home=0` for both teams on neutral ground.

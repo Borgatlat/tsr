@@ -13,6 +13,7 @@ FIFA_RAW = DATA_DIR / "fifa_rankings.csv"
 FEATURES_PATH = DATA_DIR / "features.csv"
 
 OUTCOME_MODEL_PATH = MODELS_DIR / "outcome_classifier.joblib"
+NEUTRAL_OUTCOME_MODEL_PATH = MODELS_DIR / "neutral_outcome_classifier.joblib"
 GOALS_MODEL_PATH = MODELS_DIR / "goals_poisson.joblib"
 GOALS_ENCODERS_PATH = MODELS_DIR / "goals_encoders.joblib"
 

@@ -58,6 +58,22 @@ def _team_form(team: str, history: list[dict], n: int = 20) -> dict:
     }
 
 
+def _h2h_team_win_rate(team: str, opponent: str, h2h: dict) -> float:
+    """A team's win rate vs an opponent, regardless of who was listed as home."""
+    key = tuple(sorted((team, opponent)))
+    meetings = h2h.get(key, [])
+    if not meetings:
+        return 0.5
+
+    wins = sum(
+        1
+        for m in meetings
+        if (m["home"] == team and m["home_score"] > m["away_score"])
+        or (m["away"] == team and m["away_score"] > m["home_score"])
+    )
+    return wins / len(meetings)
+
+
 def _h2h_home_rate(home: str, away: str, h2h: dict) -> float:
     """Home team's historical win rate against this opponent (excluding current match)."""
     key = tuple(sorted((home, away)))
@@ -101,6 +117,94 @@ def _recency_weight(match_date: pd.Timestamp, reference: datetime | None = None)
     ref = reference or datetime.now()
     years_ago = max((ref - match_date.to_pydatetime()).days / 365.25, 0.0)
     return 0.85 ** years_ago
+
+
+def _neutral_feature_dict(
+    team_a: str,
+    team_b: str,
+    team_a_form: dict,
+    team_b_form: dict,
+    h2h_history: dict,
+    rankings: pd.DataFrame,
+    match_date: pd.Timestamp,
+) -> dict:
+    """
+    Symmetric-friendly features for neutral venues.
+    team_a is the first-named side (e.g. Spain in 'Spain vs France').
+    """
+    h2h_a = _h2h_team_win_rate(team_a, team_b, h2h_history)
+    h2h_b = _h2h_team_win_rate(team_b, team_a, h2h_history)
+    gap = _lookup_fifa_gap(team_a, team_b, match_date, rankings)
+
+    return {
+        "team_a_win_rate_20": team_a_form["win_rate"],
+        "team_b_win_rate_20": team_b_form["win_rate"],
+        "win_rate_diff": team_a_form["win_rate"] - team_b_form["win_rate"],
+        "team_a_avg_goals_scored": team_a_form["avg_goals_scored"],
+        "team_b_avg_goals_scored": team_b_form["avg_goals_scored"],
+        "goals_scored_diff": team_a_form["avg_goals_scored"] - team_b_form["avg_goals_scored"],
+        "team_a_avg_goals_conceded": team_a_form["avg_goals_conceded"],
+        "team_b_avg_goals_conceded": team_b_form["avg_goals_conceded"],
+        "goals_conceded_diff": team_a_form["avg_goals_conceded"] - team_b_form["avg_goals_conceded"],
+        "h2h_team_a_win_rate": h2h_a,
+        "h2h_team_b_win_rate": h2h_b,
+        "fifa_ranking_gap": gap,
+        "abs_fifa_ranking_gap": abs(gap),
+    }
+
+
+NEUTRAL_OUTCOME_FEATURES = [
+    "team_a_win_rate_20",
+    "team_b_win_rate_20",
+    "win_rate_diff",
+    "team_a_avg_goals_scored",
+    "team_b_avg_goals_scored",
+    "goals_scored_diff",
+    "team_a_avg_goals_conceded",
+    "team_b_avg_goals_conceded",
+    "goals_conceded_diff",
+    "h2h_team_a_win_rate",
+    "h2h_team_b_win_rate",
+    "fifa_ranking_gap",
+    "abs_fifa_ranking_gap",
+]
+
+
+def _outcome_label_team_a(team_a_score: int, team_b_score: int) -> int:
+    """0 = team_a win, 1 = draw, 2 = team_b win."""
+    if team_a_score > team_b_score:
+        return 0
+    if team_a_score == team_b_score:
+        return 1
+    return 2
+
+
+def build_neutral_features(
+    team_a: str,
+    team_b: str,
+    team_history: dict[str, list[dict]] | None = None,
+    h2h_history: dict[tuple[str, str], list[dict]] | None = None,
+    rankings: pd.DataFrame | None = None,
+    match_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Build neutral-venue feature row for team_a vs team_b."""
+    team_a = normalize_team(team_a)
+    team_b = normalize_team(team_b)
+    match_date = match_date or pd.Timestamp.now()
+
+    if team_history is None or h2h_history is None:
+        raise ValueError("team_history and h2h_history are required")
+
+    if rankings is None:
+        rankings = pd.read_csv(FIFA_RAW, parse_dates=["date"])
+        rankings["team"] = rankings["team"].map(normalize_team)
+
+    team_a_form = _team_form(team_a, team_history.get(team_a, []))
+    team_b_form = _team_form(team_b, team_history.get(team_b, []))
+    features = _neutral_feature_dict(
+        team_a, team_b, team_a_form, team_b_form, h2h_history, rankings, match_date
+    )
+    return pd.DataFrame([features])
 
 
 def _outcome_label(home_score: int, away_score: int) -> int:
@@ -147,9 +251,11 @@ def build_features(
         h2h_rate = _h2h_home_rate(home, away, h2h_history)
         ranking_gap = _lookup_fifa_gap(home, away, match_date, rankings)
         weight = _recency_weight(match_date, reference_date)
+        neutral_feats = _neutral_feature_dict(
+            home, away, home_form, away_form, h2h_history, rankings, match_date
+        )
 
-        rows.append(
-            {
+        row = {
                 "date": match_date,
                 "home_team": home,
                 "away_team": away,
@@ -167,8 +273,10 @@ def build_features(
                 "fifa_ranking_gap": ranking_gap,
                 "recency_weight": weight,
                 "outcome": _outcome_label(home_score, away_score),
+                "team_a_outcome": _outcome_label_team_a(home_score, away_score),
             }
-        )
+        row.update(neutral_feats)
+        rows.append(row)
 
         # Update histories AFTER feature snapshot (no leakage).
         team_history.setdefault(home, []).append(
