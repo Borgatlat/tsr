@@ -201,33 +201,74 @@ def _predict_home_away(team_a: str, team_b: str, goals_model) -> dict:
     }
 
 
-def print_prediction(result: dict) -> None:
+def _knockout_probs(
+    team_a_win: float, draw: float, team_b_win: float
+) -> tuple[float, float, float]:
+    """
+    Redistribute win probabilities as if a draw cannot stand (ET + penalties).
+    Removes draw mass and rescales so team_a + team_b = 100%.
+    """
+    non_draw = team_a_win + team_b_win
+    if non_draw <= 0:
+        return 0.5, draw, 0.5
+    return team_a_win / non_draw, draw, team_b_win / non_draw
+
+
+def print_prediction(result: dict, knockout: bool = False) -> None:
     """Pretty-print prediction output."""
     if result.get("neutral"):
         print(f"\n{result['team_a']} vs {result['team_b']}  (neutral venue)")
         print("-" * 40)
-        print(
-            f"{result['team_a']} win: {result['team_a_win_prob']:.1%} | "
-            f"Draw: {result['draw_prob']:.1%} | "
-            f"{result['team_b']} win: {result['team_b_win_prob']:.1%}"
+        a_win, draw, b_win = (
+            result["team_a_win_prob"],
+            result["draw_prob"],
+            result["team_b_win_prob"],
         )
-        print(f"Most likely outcome: {result['predicted_outcome']}")
+        if knockout:
+            a_win, _, b_win = _knockout_probs(a_win, draw, b_win)
+            print("Knockout mode (draw removed — ET/penalties decide winner)")
+            print(
+                f"{result['team_a']} to advance: {a_win:.1%} | "
+                f"{result['team_b']} to advance: {b_win:.1%}"
+            )
+        else:
+            print(
+                f"{result['team_a']} win: {a_win:.1%} | "
+                f"Draw: {draw:.1%} | "
+                f"{result['team_b']} win: {b_win:.1%}"
+            )
+            print(f"Most likely outcome: {result['predicted_outcome']}")
         print(
-            f"Predicted score: {result['predicted_team_a_goals']:.2f} - "
+            f"Predicted score (90 min): {result['predicted_team_a_goals']:.2f} - "
             f"{result['predicted_team_b_goals']:.2f}"
         )
         return
 
     print(f"\n{result['home_team']} vs {result['away_team']}  (home vs away)")
     print("-" * 40)
-    print(
-        f"Home win: {result['home_win_prob']:.1%} | "
-        f"Draw: {result['draw_prob']:.1%} | "
-        f"Away win: {result['away_win_prob']:.1%}"
+    home_win, draw, away_win = (
+        result["home_win_prob"],
+        result["draw_prob"],
+        result["away_win_prob"],
     )
-    print(f"Most likely outcome: {result['predicted_outcome']}")
+    if knockout:
+        home_win, _, away_win = _knockout_probs(home_win, draw, away_win)
+        print("Knockout mode (draw removed — ET/penalties decide winner)")
+        print(
+            f"{result['home_team']} to advance: {home_win:.1%} | "
+            f"{result['away_team']} to advance: {away_win:.1%}"
+        )
+        fav = result["home_team"] if home_win >= away_win else result["away_team"]
+        print(f"Favorite to advance: {fav}")
+    else:
+        print(
+            f"Home win: {home_win:.1%} | "
+            f"Draw: {draw:.1%} | "
+            f"Away win: {away_win:.1%}"
+        )
+        print(f"Most likely outcome: {result['predicted_outcome']}")
     print(
-        f"Predicted score: {result['predicted_home_goals']:.2f} - "
+        f"Predicted score (90 min): {result['predicted_home_goals']:.2f} - "
         f"{result['predicted_away_goals']:.2f}"
     )
 
@@ -243,10 +284,15 @@ def main() -> None:
         action="store_true",
         help="Neutral venue — uses dedicated neutral outcome model",
     )
+    parser.add_argument(
+        "--knockout",
+        action="store_true",
+        help="Knockout tiebreaker — remove draw; show who advances after ET/penalties",
+    )
     args = parser.parse_args()
 
     result = predict_match(args.home_team, args.away_team, neutral=args.neutral)
-    print_prediction(result)
+    print_prediction(result, knockout=args.knockout)
 
 
 if __name__ == "__main__":
