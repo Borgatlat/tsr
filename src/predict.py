@@ -40,7 +40,9 @@ from features import (
 from train_model import OUTCOME_FEATURES, OUTCOME_LABELS
 
 
-def _load_histories() -> tuple[dict, dict]:
+def _load_histories(
+    inject: tuple[str, str, int, int] | None = None,
+) -> tuple[dict, dict]:
     """Rebuild team and head-to-head histories from all stored matches."""
     matches = pd.read_csv(MATCHES_FILTERED, parse_dates=["date"]).sort_values("date")
     matches = matches.dropna(subset=["home_score", "away_score"])
@@ -63,15 +65,38 @@ def _load_histories() -> tuple[dict, dict]:
                 "away_score": as_,
             }
         )
+
+    if inject is not None:
+        team_a, team_b, goals_a, goals_b = inject
+        team_a, team_b = normalize_team(team_a), normalize_team(team_b)
+        team_history.setdefault(team_a, []).append({"gf": goals_a, "ga": goals_b})
+        team_history.setdefault(team_b, []).append({"gf": goals_b, "ga": goals_a})
+        key = tuple(sorted((team_a, team_b)))
+        h2h_history.setdefault(key, []).append(
+            {
+                "home": team_a,
+                "away": team_b,
+                "home_score": goals_a,
+                "away_score": goals_b,
+            }
+        )
+
     return team_history, h2h_history
 
 
-def build_match_features(home: str, away: str) -> pd.DataFrame:
+def build_match_features(
+    home: str,
+    away: str,
+    histories: tuple[dict, dict] | None = None,
+) -> pd.DataFrame:
     """Assemble feature vector for a home-vs-away fixture."""
     home = normalize_team(home)
     away = normalize_team(away)
 
-    team_history, h2h_history = _load_histories()
+    if histories is None:
+        team_history, h2h_history = _load_histories()
+    else:
+        team_history, h2h_history = histories
     rankings = pd.read_csv(FIFA_RAW, parse_dates=["date"])
     rankings["team"] = rankings["team"].map(normalize_team)
 
@@ -101,9 +126,13 @@ def _neutral_prediction(
     goals_model,
     team_a: str,
     team_b: str,
+    histories: tuple[dict, dict] | None = None,
 ) -> dict:
     """Single-pass neutral prediction for team_a vs team_b."""
-    team_history, h2h_history = _load_histories()
+    if histories is None:
+        team_history, h2h_history = _load_histories()
+    else:
+        team_history, h2h_history = histories
     features = build_neutral_features(team_a, team_b, team_history, h2h_history)
     probs = outcome_model.predict_proba(features[NEUTRAL_OUTCOME_FEATURES])[0]
     pred_class = int(np.argmax(probs))
@@ -127,7 +156,12 @@ def _neutral_prediction(
     }
 
 
-def predict_match(home: str, away: str, neutral: bool = False) -> dict:
+def predict_match(
+    home: str,
+    away: str,
+    neutral: bool = False,
+    recent_result: tuple[str, str, int, int] | None = None,
+) -> dict:
     """Return outcome probabilities and expected goals for a matchup."""
     if not OUTCOME_MODEL_PATH.exists() or not GOALS_MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -137,6 +171,7 @@ def predict_match(home: str, away: str, neutral: bool = False) -> dict:
     goals_model = joblib.load(GOALS_MODEL_PATH)
     team_a = normalize_team(home)
     team_b = normalize_team(away)
+    histories = _load_histories(inject=recent_result)
 
     if neutral:
         if not NEUTRAL_OUTCOME_MODEL_PATH.exists():
@@ -146,8 +181,8 @@ def predict_match(home: str, away: str, neutral: bool = False) -> dict:
         outcome_model = joblib.load(NEUTRAL_OUTCOME_MODEL_PATH)
 
         # Average both orderings so argument order never affects the result.
-        ab = _neutral_prediction(outcome_model, goals_model, team_a, team_b)
-        ba = _neutral_prediction(outcome_model, goals_model, team_b, team_a)
+        ab = _neutral_prediction(outcome_model, goals_model, team_a, team_b, histories)
+        ba = _neutral_prediction(outcome_model, goals_model, team_b, team_a, histories)
 
         team_a_win = (ab["team_a_win_prob"] + ba["team_b_win_prob"]) / 2
         team_b_win = (ab["team_b_win_prob"] + ba["team_a_win_prob"]) / 2
@@ -171,13 +206,18 @@ def predict_match(home: str, away: str, neutral: bool = False) -> dict:
             "predicted_team_b_goals": float(pred_b_goals),
         }
 
-    return _predict_home_away(team_a, team_b, goals_model)
+    return _predict_home_away(team_a, team_b, goals_model, histories)
 
 
-def _predict_home_away(team_a: str, team_b: str, goals_model) -> dict:
+def _predict_home_away(
+    team_a: str,
+    team_b: str,
+    goals_model,
+    histories: tuple[dict, dict] | None = None,
+) -> dict:
     """Predict a true home-vs-away fixture (team_a at home)."""
     outcome_model = joblib.load(OUTCOME_MODEL_PATH)
-    features = build_match_features(team_a, team_b)
+    features = build_match_features(team_a, team_b, histories)
     probs = outcome_model.predict_proba(features[OUTCOME_FEATURES])[0]
     pred_class = int(np.argmax(probs))
 
@@ -214,8 +254,10 @@ def _knockout_probs(
     return team_a_win / non_draw, draw, team_b_win / non_draw
 
 
-def print_prediction(result: dict, knockout: bool = False) -> None:
+def print_prediction(result: dict, knockout: bool = False, note: str | None = None) -> None:
     """Pretty-print prediction output."""
+    if note:
+        print(f"Context: {note}")
     if result.get("neutral"):
         print(f"\n{result['team_a']} vs {result['team_b']}  (neutral venue)")
         print("-" * 40)
@@ -289,10 +331,32 @@ def main() -> None:
         action="store_true",
         help="Knockout tiebreaker — remove draw; show who advances after ET/penalties",
     )
+    parser.add_argument(
+        "--after",
+        nargs=3,
+        metavar=("OPPONENT", "GOALS_FOR", "GOALS_AGAINST"),
+        help="Inject a recent result for the first team before predicting "
+        "(e.g. --after Switzerland 3 1)",
+    )
     args = parser.parse_args()
 
-    result = predict_match(args.home_team, args.away_team, neutral=args.neutral)
-    print_prediction(result, knockout=args.knockout)
+    recent = None
+    note = None
+    if args.after:
+        opponent, goals_for, goals_against = args.after
+        recent = (args.home_team, opponent, int(goals_for), int(goals_against))
+        note = (
+            f"{args.home_team} coming off a {goals_for}-{goals_against} win "
+            f"vs {opponent} (incl. extra time)"
+        )
+
+    result = predict_match(
+        args.home_team,
+        args.away_team,
+        neutral=args.neutral,
+        recent_result=recent,
+    )
+    print_prediction(result, knockout=args.knockout, note=note)
 
 
 if __name__ == "__main__":
