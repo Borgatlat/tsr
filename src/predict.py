@@ -41,7 +41,7 @@ from train_model import OUTCOME_FEATURES, OUTCOME_LABELS
 
 
 def _load_histories(
-    inject: tuple[str, str, int, int] | None = None,
+    inject: list[tuple[str, str, int, int]] | None = None,
 ) -> tuple[dict, dict]:
     """Rebuild team and head-to-head histories from all stored matches."""
     matches = pd.read_csv(MATCHES_FILTERED, parse_dates=["date"]).sort_values("date")
@@ -66,8 +66,8 @@ def _load_histories(
             }
         )
 
-    if inject is not None:
-        team_a, team_b, goals_a, goals_b = inject
+    for entry in inject or []:
+        team_a, team_b, goals_a, goals_b = entry
         team_a, team_b = normalize_team(team_a), normalize_team(team_b)
         team_history.setdefault(team_a, []).append({"gf": goals_a, "ga": goals_b})
         team_history.setdefault(team_b, []).append({"gf": goals_b, "ga": goals_a})
@@ -160,7 +160,7 @@ def predict_match(
     home: str,
     away: str,
     neutral: bool = False,
-    recent_result: tuple[str, str, int, int] | None = None,
+    recent_results: list[tuple[str, str, int, int]] | None = None,
 ) -> dict:
     """Return outcome probabilities and expected goals for a matchup."""
     if not OUTCOME_MODEL_PATH.exists() or not GOALS_MODEL_PATH.exists():
@@ -171,7 +171,7 @@ def predict_match(
     goals_model = joblib.load(GOALS_MODEL_PATH)
     team_a = normalize_team(home)
     team_b = normalize_team(away)
-    histories = _load_histories(inject=recent_result)
+    histories = _load_histories(inject=recent_results)
 
     if neutral:
         if not NEUTRAL_OUTCOME_MODEL_PATH.exists():
@@ -335,26 +335,38 @@ def main() -> None:
         "--after",
         nargs=3,
         metavar=("OPPONENT", "GOALS_FOR", "GOALS_AGAINST"),
-        help="Inject a recent result for the first team before predicting "
-        "(e.g. --after Switzerland 3 1)",
+        help="Recent result for the first team (e.g. --after Switzerland 3 1)",
+    )
+    parser.add_argument(
+        "--after-away",
+        nargs=3,
+        metavar=("OPPONENT", "GOALS_FOR", "GOALS_AGAINST"),
+        help="Recent result for the second team (e.g. --after-away Norway 2 1)",
     )
     args = parser.parse_args()
 
-    recent = None
-    note = None
+    recent: list[tuple[str, str, int, int]] = []
+    notes: list[str] = []
     if args.after:
         opponent, goals_for, goals_against = args.after
-        recent = (args.home_team, opponent, int(goals_for), int(goals_against))
-        note = (
-            f"{args.home_team} coming off a {goals_for}-{goals_against} win "
-            f"vs {opponent} (incl. extra time)"
+        recent.append((args.home_team, opponent, int(goals_for), int(goals_against)))
+        notes.append(
+            f"{args.home_team} beat {opponent} {goals_for}-{goals_against} (ET)"
         )
+    if args.after_away:
+        opponent, goals_for, goals_against = args.after_away
+        recent.append((args.away_team, opponent, int(goals_for), int(goals_against)))
+        notes.append(
+            f"{args.away_team} beat {opponent} {goals_for}-{goals_against} (ET)"
+        )
+
+    note = " | ".join(notes) if notes else None
 
     result = predict_match(
         args.home_team,
         args.away_team,
         neutral=args.neutral,
-        recent_result=recent,
+        recent_results=recent or None,
     )
     print_prediction(result, knockout=args.knockout, note=note)
 
